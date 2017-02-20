@@ -2,9 +2,7 @@
 
 --[[
     Lua tracking projectile.
-  
-  -- Usage add require('TrackingProjectiles') to your gamemode files and you should be good to go!
-  
+
     Requires a param with AT LEAST:
     - hTarget = the unit handle the projectile should fly to.
     - hCaster = the unit handle the projectile originates from.
@@ -14,6 +12,9 @@
     - SoundName = The sound when the projectile hits
     - flRadius = the radius the projectile has
 
+    - OnProjectileHitUnit = The function called when projectile hits
+    - OnProjectileDestroy = The function called when the projectile gets destroyed when it didn't hit a unit
+
     Optional
     - bDodgeable = Does the projectile disjoint?
     - bDestroyOnDodge = Does the projectile destroy it self on disjoint?
@@ -22,6 +23,7 @@
     - bDestroyOnGroundHit = Destroy this when it hits ground (Very unlikely to be used)
     - flAcceleration = The rate the projectile speed changes per second
     - fMaxDistance = The maximum distance the particle is allowed to go from a projectile
+    - DestructionEffectName =  The effect when destroyed
     
     These take priority over each other (Still optional, not using this looks bad)
     - vSpawnOrigin = caster:GetAbsOrigin()
@@ -48,13 +50,26 @@
         EffectName = "particles/units/heroes/hero_tinker/tinker_missile.vpcf",
         SoundName = "Hero_Tinker.Heat-Seeking_Missile.Impact",
         flRadius = ability:GetSpecialValueFor("radius") or 200
+        OnProjectileHitUnit = function(params, projectileID) 
+          local damageTable = {
+            victim = params.hTarget,
+            attacker = params.hCaster,
+            damage =  hAbility:GetSpecialValueFor("damage"),
+            damage_type = DAMAGE_TYPE_MAGICAL,
+            ability = hAbility,
+          }
+          ApplyDamage(damageTable)
+        end,
+        OnProjectileDestroy = function(params, projectileID) 
+            local particle = ParticleManager:CreateParticle(params.DestructionEffectName, PATTACH_ABSORIGIN_FOLLOW, params.hTarget) 
+            ParticleManager:SetParticleControlEnt(particle, 1, params.hTarget, PATTACH_POINT_FOLLOW, "attach_hitloc", projectileID.projectile, true)
+        end,
 
         -- Optional, can be omitted
         bDodgeable = true,
         bDestroyOnDodge = false,
         flVisionRadius = ability:GetSpecialValueFor("radius") or 200,
         flExpireTime = ability:GetSpecialValueFor("expire_time") or 5,
-        bDestroyOnGroundHit = false,
         flAcceleration = 1.1
     
         -- These take priority over each other (Still optional)
@@ -103,6 +118,7 @@ function TrackingProjectiles:Projectile( params )
     ParticleManager:SetParticleControl( particle, 2, Vector( speed, 0, 0 ) )
 
     -- Creating a projectileID so it can be referred to later
+    params.bProjectileDodged = false
     local projectileID = {projectile=projectile,particle=particle}
     TrackingProjectiles:Think(params,projectileID)
     return projectileID
@@ -127,15 +143,20 @@ function TrackingProjectiles:Think(params,projectileID)
             return nil
         end
         -- Check if this projectile has been dodged and if it should be destroyed because of that
-        if params.bDestroyOnDodge and target.dodged then
+        if params.bDestroyOnDodge and params.bDodgeable and target.dodged then
             ParticleManager:DestroyParticle( particle, false )
             ParticleManager:ReleaseParticleIndex(particle)
             return nil
+        end
+        -- Check if the particle has been dodged to prevent it from firing on hit effects
+        if params.bDodgeable and target.dodged then
+            params.bProjectileDodged = true
         end
         -- Check if the timer for the projectile has ran out
         if params.flExpireTime and GameRules:GetGameTime() - params.creation_time > params.flExpireTime then
             ParticleManager:DestroyParticle( particle, false )
             ParticleManager:ReleaseParticleIndex(particle)
+            pcall(params.OnProjectileDestroy, params, projectileID)
             return nil
         end
         -- If there is a new speed, store that
@@ -175,6 +196,16 @@ function TrackingProjectiles:Think(params,projectileID)
             -- Platform hit
             ParticleManager:DestroyParticle( particle, false )
             ParticleManager:ReleaseParticleIndex(particle)
+            pcall(params.OnProjectileDestroy, params, projectileID)
+            return nil
+        end
+
+        -- Check if projectile has hit a wall
+        if params.bDestroyOnWallHit and Gridnav:IsWall(projectiles) then
+            -- Platform hit
+            ParticleManager:DestroyParticle( particle, false )
+            ParticleManager:ReleaseParticleIndex(particle)
+            pcall(params.OnProjectileDestroy, params, projectileID)
             return nil
         end
 
@@ -189,6 +220,7 @@ function TrackingProjectiles:Think(params,projectileID)
         elseif params.flMaxDistance and (target_location - projectile):Length() > params.flMaxDistance then
                 ParticleManager:DestroyParticle( particle, false )
                 ParticleManager:ReleaseParticleIndex(particle)
+                pcall(params.OnProjectileDestroy, params, projectileID)
                 return nil
         else
             return 1/32
@@ -222,22 +254,8 @@ end
 function TrackingProjectiles:OnProjectileHitUnit( params,projectileID )
     --[[print( params.hCaster:GetUnitName() .. '\'s particle hit ' .. params.hTarget:GetUnitName() .. ' after ' ..
         ( GameRules:GetGameTime() - params.creation_time ) .. ' seconds.' )]]
-    if not params.hTarget.dodged then
-        local damageTable = 
-        {
-            victim = params.hTarget,
-            attacker = params.hCaster,
-            damage = params.hAbility:GetSpecialValueFor("damage") + RandomInt(0,params.hAbility:GetSpecialValueFor("damage_offset")),
-            damage_type =  DAMAGE_TYPE_MAGICAL, -- params.hAbility:GetAbilityDamageType() or 
-            ability = params.hAbility,
-        }
-        casterloc = params.hCaster:GetAbsOrigin()
-        params.hCaster:SetAbsOrigin(projectileID.projectile)
-        ApplyDamage(damageTable)
-        params.hCaster:SetAbsOrigin(casterloc)
-
-        --Sound effect
-        params.hCaster:EmitSound(params.SoundName)
+    if not params.bProjectileDodged then
+        pcall(params.OnProjectileHitUnit, params, projectileID)
     end
 end
 
@@ -253,10 +271,8 @@ function TrackingProjectiles:hookFunctions()
         if unit then
             unit.dodged = true
         end
-
         -- Run the real function for other projectiles
         oldProjectileDodge(projectileManager,unit)
-
     end
 end
     
